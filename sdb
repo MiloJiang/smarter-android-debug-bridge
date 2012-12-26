@@ -1,14 +1,69 @@
 #!/usr/bin/env python3
 
 import sys
+import time
+import stat
+import struct
 
-def D(fmt, *args, **kwargs):
-    if(len(args) == 0 and len(kwargs) == 0):
-        print(fmt)
+def D(*args, **kwargs):
+    if len(args) == 0:
+        text = ''
+
+    elif isinstance(args[0], str):
+        try:
+            fmt = args[0]
+            pargs = args[1:]
+            text = fmt.format(*pargs, **kwargs)
+        except:
+            raise
+
+    elif len(args) == 1:
+        text = str(args[0])
+
     else:
-        print(fmt.format(*args, **kwargs))
+        text = ", ".join([str(arg) for arg in args])
 
+    sys.stdout.write(text+'\n')
     sys.stdout.flush()
+
+def ftime(unixtime):
+    st = time.localtime(unixtime)
+    ft = time.strftime("%Y-%m-%d %H:%M:%S", st)
+    return ft
+
+def fmode(mode):
+    def fmodtriplet(triplet):
+        m = ''
+        m += 'r' if triplet & stat.S_IROTH else '-'
+        m += 'w' if triplet & stat.S_IWOTH else '-'
+        m += 'x' if triplet & stat.S_IXOTH else '-'
+        return m
+
+    def fmodtype(mode):
+        checkers = [
+            ('-', stat.S_ISREG),
+            ('d', stat.S_ISDIR),
+            ('c', stat.S_ISCHR),
+            ('l', stat.S_ISLNK),
+        ]
+
+        for (ftype, checker) in checkers:
+            if checker(mode):
+                return ftype
+
+        return '?'
+
+    text_mode = ''
+    ftype = fmodtype(mode)
+
+    for i in range(3):
+        text_mode = fmodtriplet(mode) + text_mode
+        mode >>= 3
+
+    return ftype + text_mode
+
+def fentry(mode, fsize, mtime, fname):
+    return "{m} {s:10} {t} {n}".format(t=ftime(mtime), s=fsize, n=fname, m=fmode(mode))
 
 class AdbClient(object):
     def __init__(self):
@@ -33,29 +88,81 @@ class AdbClient(object):
         rc = self.socket.sendall(command)
         assert(rc is None)
 
+        self.checkOKAY()
+
+    def checkOKAY(self):
         data = self.socket.recv(4)
         if data != b'OKAY':
             raise Exception()
 
-        data = self.socket.recv(4)
-        reply_len = int(data, 16)
+    def recvContentLength(self):
+        data = self.recvData(4)
+        return int(data, 16)
 
-        return self.socket.recv(reply_len)
-
-    def executeCommand(self, command):
-        self.connect()
-        data = self.sendCommand(command)
-        self.disconnect()
+    def recvData(self, size):
+        data = self.socket.recv(size)
         return data
 
+    def doSTAT(self, fname):
+        cmd = b'STAT' + struct.pack('<I', len(fname))
+        self.socket.send(cmd)
+        self.socket.sendall(bytes(fname, 'ascii'))
+        data = self.socket.recv(16)
+        (mode, size, mtime) = struct.unpack('<III', data[4:])
+        return (mode, size, mtime)
+
+    def doLIST(self, dirname):
+        cmd = b'LIST' + struct.pack('<I', len(dirname))
+        self.socket.send(cmd)
+        self.socket.sendall(bytes(dirname, 'ascii'))
+
+        ls = []
+        while True:
+            data = self.socket.recv(20)
+            if data[0:4] == b'DONE':
+                break
+
+            (x, fsize, mtime, fname_len) = struct.unpack('<IIII', data[4:])
+            fname = self.socket.recv(fname_len)
+            fname = str(fname, 'utf8')
+
+            entry = (fname, fsize, mtime, x)
+            ls.append(entry)
+
+        return ls
+
     def getVersion(self):
-        data = self.executeCommand(b'host:version')
+        self.connect()
+        self.sendCommand(b'host:version')
+        l = self.recvContentLength()
+        data = self.recvData(l)
         version = int(data, 16)
+        self.disconnect()
         return version
 
     def listDevices(self):
-        data = self.executeCommand(b'host:devices')
+        self.connect()
+        self.sendCommand(b'host:devices')
+        l = self.recvContentLength()
+        data = self.recvData(l)
+        self.disconnect()
         return str(data, 'ascii')
+
+    def statFile(self, fname):
+        self.connect()
+        self.sendCommand(b'host:transport-any')
+        self.sendCommand(b'sync:')
+        data = self.doSTAT(fname)
+        self.disconnect()
+        return data
+
+    def listDir(self, dirname):
+        self.connect()
+        self.sendCommand(b'host:transport-any')
+        self.sendCommand(b'sync:')
+        data = self.doLIST(dirname)
+        self.disconnect()
+        return data
 
 def show_version(adb):
     version = adb.getVersion()
@@ -65,33 +172,61 @@ def list_devices(adb):
     devices = adb.listDevices()
     D(devices)
 
-COMMANDS = {
-    'version': show_version,
-    'devices': list_devices,
-}
+def stat_file(adb, fname):
+    (mode, fsize, mtime) = adb.statFile(fname)
+    D(fentry(mode, fsize, mtime, fname))
+
+def list_dir(adb, dirname):
+    data = adb.listDir(dirname)
+    for (fname, fsize, mtime, mode) in data:
+        D(fentry(mode, fsize, mtime, fname))
+
+COMMANDS = [
+    ('version', show_version, 0),
+    ('devices', list_devices, 0),
+    ('stat', stat_file, 1),
+    ('list', list_dir, 1),
+]
 
 def usage():
     D("Usage: {} <command>", sys.argv[0])
     D("")
     D("Available commands:")
-    for cmd in COMMANDS:
-        D("    {}", cmd)
+    for (cmd, func, nargs) in COMMANDS:
+        D("    {c}{a}", c=cmd, a=" <arg>"*nargs)
+
+def unknown(cmd):
+    D("Unknonwn command: '{}'", command)
+    D("")
+    usage()
 
 def main(args):
-    if len(args) == 1:
+    argc = len(args)
+    if argc == 1:
         usage()
         return
+
 
     command = args[1]
-    if command not in COMMANDS:
-        D("Unknonw command: '{}'", command)
-        D("")
-        usage()
-        return
+    for (cmd, func, nargs) in COMMANDS:
+        if command == cmd:
+            if argc-2 != nargs:
+                D("Bad number of args for command '{}'", cmd)
+                D("")
+                usage()
+            else:
+                func(AdbClient(), *(args[2:]))
+            return
 
-    do_function = COMMANDS[command]
-    do_function(AdbClient())
+    unknown(command)
+
+def test_all_commands():
+    show_version(AdbClient())
+    list_devices(AdbClient())
+    stat_file(AdbClient(), '/sdcard/')
+    list_dir(AdbClient(), '/sdcard/')
 
 if __name__ == "__main__":
     main(sys.argv)
+    #test_all_commands()
 
